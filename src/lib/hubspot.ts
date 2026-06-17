@@ -1,7 +1,24 @@
 const HUBSPOT_TOKEN = () => process.env.HUBSPOT_TOKEN || '';
 
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// Fetch with retry/backoff on rate limits (429) and transient server errors (5xx).
+// Needed because the sync runs many requests concurrently.
+async function fetchWithRetry(url: string, init: RequestInit, attempts = 5): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(url, init);
+    if ((res.status === 429 || res.status >= 500) && attempt < attempts) {
+      const retryAfter = parseFloat(res.headers.get('retry-after') || '');
+      const waitMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : Math.min(1000 * 2 ** (attempt - 1), 8000);
+      await sleep(waitMs);
+      continue;
+    }
+    return res;
+  }
+}
+
 async function hubspotGet(endpoint: string) {
-  const res = await fetch(`https://api.hubapi.com${endpoint}`, {
+  const res = await fetchWithRetry(`https://api.hubapi.com${endpoint}`, {
     headers: {
       Authorization: `Bearer ${HUBSPOT_TOKEN()}`,
       'Content-Type': 'application/json',
@@ -16,7 +33,7 @@ async function hubspotGet(endpoint: string) {
 }
 
 async function hubspotPost(endpoint: string, body: any) {
-  const res = await fetch(`https://api.hubapi.com${endpoint}`, {
+  const res = await fetchWithRetry(`https://api.hubapi.com${endpoint}`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${HUBSPOT_TOKEN()}`,
@@ -32,7 +49,7 @@ async function hubspotPost(endpoint: string, body: any) {
 }
 
 async function hubspotDelete(endpoint: string) {
-  const res = await fetch(`https://api.hubapi.com${endpoint}`, {
+  const res = await fetchWithRetry(`https://api.hubapi.com${endpoint}`, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${HUBSPOT_TOKEN()}` },
   });
@@ -43,7 +60,7 @@ async function hubspotDelete(endpoint: string) {
 }
 
 async function hubspotPatch(endpoint: string, body: any) {
-  const res = await fetch(`https://api.hubapi.com${endpoint}`, {
+  const res = await fetchWithRetry(`https://api.hubapi.com${endpoint}`, {
     method: 'PATCH',
     headers: {
       Authorization: `Bearer ${HUBSPOT_TOKEN()}`,

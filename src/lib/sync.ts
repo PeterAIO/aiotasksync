@@ -1,4 +1,4 @@
-import { getMappings, getSyncState, saveSyncState, type SyncState } from './store';
+import { getMappings, getSyncState, saveSyncState, type SyncState, type Mappings } from './store';
 import { getProjectTasksBySections, getSubtasksDeep } from './asana';
 import { createNote, deleteNote, findSyncNotes } from './hubspot';
 
@@ -169,22 +169,53 @@ export interface SyncResult {
   error?: string;
 }
 
+// How many mappings to sync at once. Rate-limit 429s are handled by retry/backoff
+// in the Asana/HubSpot layers, so this self-throttles under load.
+const SYNC_CONCURRENCY = 5;
+
+interface SyncItem {
+  objectType: 'companies' | 'deals';
+  id: string;
+  mapping: { projectId: string; projectName: string; companyName?: string; dealName?: string };
+  type: 'company' | 'deal';
+  name: string;
+}
+
+function collectItems(mappings: Mappings): SyncItem[] {
+  const items: SyncItem[] = [];
+  for (const [id, mapping] of Object.entries(mappings.companies || {})) {
+    if (mapping.projectId) items.push({ objectType: 'companies', id, mapping, type: 'company', name: mapping.companyName || '' });
+  }
+  for (const [id, mapping] of Object.entries(mappings.deals || {})) {
+    if (mapping.projectId) items.push({ objectType: 'deals', id, mapping, type: 'deal', name: mapping.dealName || '' });
+  }
+  return items;
+}
+
+// Run `fn` over items with a bounded number in flight at once. Results keep input order.
+async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
+}
+
 export async function runFullSync(force: boolean = false, runType: 'manual' | 'auto' = 'auto'): Promise<SyncResult[]> {
   const mappings = await getMappings();
   const syncState = await getSyncState();
-  const results: SyncResult[] = [];
+  const items = collectItems(mappings);
 
-  for (const [companyId, mapping] of Object.entries(mappings.companies || {})) {
-    if (!mapping.projectId) continue;
-    const result = await syncOne('companies', companyId, mapping, syncState, force);
-    results.push({ type: 'company', id: companyId, name: mapping.companyName || '', ...result });
-  }
-
-  for (const [dealId, mapping] of Object.entries(mappings.deals || {})) {
-    if (!mapping.projectId) continue;
-    const result = await syncOne('deals', dealId, mapping, syncState, force);
-    results.push({ type: 'deal', id: dealId, name: mapping.dealName || '', ...result });
-  }
+  const results = await mapPool(items, SYNC_CONCURRENCY, async (item): Promise<SyncResult> => {
+    const result = await syncOne(item.objectType, item.id, item.mapping, syncState, force);
+    return { type: item.type, id: item.id, name: item.name, ...result };
+  });
 
   await saveSyncState(syncState, runType);
   return results;
@@ -207,35 +238,20 @@ export async function runStreamingSync(
 ): Promise<void> {
   const mappings = await getMappings();
   const syncState = await getSyncState();
-
-  // Build list of all items to sync
-  const items: { objectType: 'companies' | 'deals'; id: string; mapping: any }[] = [];
-  for (const [companyId, mapping] of Object.entries(mappings.companies || {})) {
-    if (mapping.projectId) items.push({ objectType: 'companies', id: companyId, mapping });
-  }
-  for (const [dealId, mapping] of Object.entries(mappings.deals || {})) {
-    if (mapping.projectId) items.push({ objectType: 'deals', id: dealId, mapping });
-  }
+  const items = collectItems(mappings);
 
   onEvent({ type: 'start', total: items.length });
 
-  for (let i = 0; i < items.length; i++) {
-    const { objectType, id, mapping } = items[i];
-    const name = objectType === 'companies' ? (mapping.companyName || '') : (mapping.dealName || '');
-    const label = objectType === 'companies' ? 'Company' : 'Deal';
+  // Items run concurrently; emit progress/result as each one finishes.
+  let completed = 0;
+  await mapPool(items, SYNC_CONCURRENCY, async (item) => {
+    const result = await syncOne(item.objectType, item.id, item.mapping, syncState, force);
+    const syncResult: SyncResult = { type: item.type, id: item.id, name: item.name, ...result };
 
-    onEvent({ type: 'progress', current: i + 1, total: items.length, name, step: `Syncing ${label}: ${name}` });
-
-    const result = await syncOne(objectType, id, mapping, syncState, force);
-    const syncResult: SyncResult = {
-      type: objectType === 'companies' ? 'company' : 'deal',
-      id,
-      name,
-      ...result,
-    };
-
-    onEvent({ type: 'result', current: i + 1, total: items.length, result: syncResult });
-  }
+    completed++;
+    onEvent({ type: 'progress', current: completed, total: items.length, name: item.name, step: `Synced ${item.name}` });
+    onEvent({ type: 'result', current: completed, total: items.length, result: syncResult });
+  });
 
   await saveSyncState(syncState, runType);
 }

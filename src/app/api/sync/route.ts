@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { runFullSync, runStreamingSync } from '@/lib/sync';
 
+// Give the sync the full serverless time budget.
+export const maxDuration = 300;
+
 // Manual sync (from UI button) — streams progress
 export async function POST() {
   try {
